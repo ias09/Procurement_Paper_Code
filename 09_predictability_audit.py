@@ -1,42 +1,3 @@
-"""
-09_predictability_audit.py
-============================
-PLAIN-LANGUAGE PURPOSE (Idea 4 from the updated proposal):
-Before building any model on a procurement dataset, run a 5-minute health
-check that answers: "does lateness in this data actually follow any pattern,
-or is it basically random?" If it's random, no model -- however fancy --
-can predict it, and the company should know that BEFORE spending weeks on ML.
-
-The check computes, for each dataset:
-
-  1. SUPPLIER SPREAD: how different are suppliers from each other?
-     If every supplier is late ~30% of the time, supplier identity tells you
-     nothing. If some are late 10% and others 45%, there's real signal.
-     (statistic: standard deviation + min/max of per-supplier late rates)
-
-  2. ORACLE CORRELATION: the "cheating ceiling". We let ourselves cheat and
-     use each supplier's FULL history (including the future) as a predictor.
-     No honest model can beat this cheat. If even the cheat correlates ~0
-     with outcomes, the dataset is unpredictable, full stop.
-
-  3. FEATURE CORRELATIONS: do basic order facts (quantity, price, lead time)
-     relate to delay at all?
-
-  4. PREDICTED AUC BAND: a rough empirical mapping from the above statistics
-     to the ROC-AUC a good model can realistically achieve. Calibrated from
-     our own three datasets + published benchmarks.
-
-We then VALIDATE the audit by comparing its predictions against the actual
-model results we already obtained in scripts 03/07/08:
-  synthetic  -> audit says "learnable"   -> actual AUC 0.80  (correct?)
-  dataset1   -> audit says "random-like" -> actual AUC 0.49  (correct?)
-  dataco     -> audit says "learnable"   -> actual AUC 0.75  (correct?)
-
-Outputs:
-  - results/predictability_audit.csv
-  - results/predictability_audit_report.txt  (human-readable verdicts)
-"""
-
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -50,17 +11,15 @@ def audit_dataset(df: pd.DataFrame, entity_col: str, name: str) -> dict:
     out = {"dataset": name, "n_rows": len(df), "n_entities": df[entity_col].nunique(),
            "late_rate": df["late"].mean()}
 
-    # --- 1. Supplier (entity) spread ---
     by_entity = df.groupby(entity_col)["late"].agg(["mean", "count"])
     stable = by_entity[by_entity["count"] >= 20]
-    if len(stable) < 3:  # entities have few orders each (e.g. dataco customers)
+    if len(stable) < 3:  
         stable = by_entity[by_entity["count"] >= 5]
     out["entity_late_rate_std"] = stable["mean"].std()
     out["entity_late_rate_min"] = stable["mean"].min()
     out["entity_late_rate_max"] = stable["mean"].max()
     out["entity_late_rate_range"] = out["entity_late_rate_max"] - out["entity_late_rate_min"]
 
-    # --- 2. Oracle correlation (the cheating ceiling) ---
     oracle_entity = df.groupby(entity_col)["late"].transform("mean")
     out["oracle_entity_corr"] = oracle_entity.corr(df["late"])
 
@@ -71,16 +30,12 @@ def audit_dataset(df: pd.DataFrame, entity_col: str, name: str) -> dict:
     else:
         out["oracle_category_corr"] = np.nan
 
-    # --- 3. Basic feature correlations with delay magnitude ---
     for col in ["quantity", "unit_price", "promised_lead_time"]:
         if col in df.columns:
             out[f"corr_{col}_delay"] = df[col].corr(df["delay_days"])
         else:
             out[f"corr_{col}_delay"] = np.nan
 
-    # --- 4. Predicted achievable AUC band ---
-    # The oracle entity correlation is the dominant indicator, with the
-    # category oracle as a secondary source of signal.
     r = max(out["oracle_entity_corr"] if not pd.isna(out["oracle_entity_corr"]) else 0,
             out["oracle_category_corr"] if not pd.isna(out["oracle_category_corr"]) else 0)
     if r < 0.10:
@@ -112,7 +67,6 @@ def main():
     audit_df = pd.DataFrame(audits)
     audit_df.to_csv(RESULTS_DIR / "predictability_audit.csv", index=False)
 
-    # --- validate audit predictions against realized model results ---
     realized = {}
     try:
         m = pd.read_csv(RESULTS_DIR / "model_metrics.csv")

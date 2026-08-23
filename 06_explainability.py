@@ -1,31 +1,5 @@
-"""
-06_explainability.py
-======================
-Proposal mapping: Section 17.6 (Explainability), Section 19 (Expected
-Contributions -- driver analysis).
 
-Uses SHAP (TreeExplainer) on CatBoost models (chosen because CatBoost was
-among the best-calibrated AND best-discriminating models in 03/04, and
-TreeExplainer SHAP values for CatBoost are exact, not approximated).
-
-Refits CatBoost classifier (target: late) and regressor (target: delay_days)
-on the TRAIN fold using the same hyperparameters as 03_modeling.py (03 did
-not persist model objects to disk, so refitting here is the cleanest path --
-results are bit-for-bit reproducible given RANDOM_SEED).
-
-SANITY-CHECK ANGLE: because 00_generate_synthetic_data.py built in a KNOWN
-causal structure (supplier identity, material complexity, tight lead times,
-urgency, seasonality), we check here whether SHAP's top features plausibly
-recover that structure. This is a useful robustness narrative for the paper:
-"the explainability layer recovers the known generative drivers."
-
-Outputs:
-  - results/shap_importance_classification.csv
-  - results/shap_importance_regression.csv
-  - results/shap_summary_classification.png
-  - results/shap_summary_regression.png
-"""
-
+import json
 import warnings
 from pathlib import Path
 
@@ -54,6 +28,27 @@ CATEGORICAL_CANDIDATES = [
     "supplier_id", "material_or_category", "order_priority_or_type",
     "plant_id", "buyer_id",
 ]
+
+CATBOOST_REG_PARAMS = {"n_estimators": 400, "learning_rate": 0.05, "depth": 6}
+
+
+def load_tuned_classifier_params():
+   
+    params_path = RESULTS_DIR / "optuna_best_params.json"
+    if not params_path.exists():
+        raise FileNotFoundError(
+            f"{params_path} not found. Run 03_modeling.py before this script -- "
+            "SHAP must explain the tuned CatBoost classifier that 03 reports as "
+            "the best model, not an untuned default."
+        )
+    with open(params_path) as fh:
+        best = json.load(fh)
+    if "catboost_clf" not in best:
+        raise KeyError(
+            "optuna_best_params.json has no 'catboost_clf' key. "
+            "Regenerate it by re-running 03_modeling.py."
+        )
+    return best["catboost_clf"]
 
 
 def load_synthetic():
@@ -89,10 +84,7 @@ def build_feature_matrix(train, *other_frames):
 
 
 def aggregate_onehot_importance(mean_abs_shap, columns):
-    """Collapses one-hot-encoded dummy columns (e.g. supplier_id_S01,
-    supplier_id_S02, ...) back into a single importance per ORIGINAL
-    categorical feature (e.g. supplier_id), summed across its dummies.
-    Numeric columns pass through unchanged."""
+  
     grouped = {}
     for col, val in zip(columns, mean_abs_shap):
         base = col
@@ -105,36 +97,21 @@ def aggregate_onehot_importance(mean_abs_shap, columns):
 
 
 def run_shap(model, X, model_label, sample_size=500, random_seed=RANDOM_SEED):
-    """
-    Compute SHAP values and produce five outputs per model_label:
-
-      shap_importance_{model_label}.csv     — aggregated mean |SHAP|
-      shap_bar_{model_label}.pdf/.png       — horizontal bar chart, top 10
-      shap_beeswarm_{model_label}.pdf/.png  — beeswarm, top 10 (direction)
-      shap_waterfall_{model_label}.pdf/.png — waterfall for one representative order
-      shap_scatter_{model_label}.pdf/.png   — dependence plot for top feature
-
-    Parameters
-    ----------
-    model       : fitted CatBoost classifier or regressor
-    X           : encoded feature DataFrame (test fold)
-    model_label : "classification" or "regression"
-    sample_size : number of rows to use for beeswarm / scatter (speed)
-    """
-    # ── SHAP values (full test set for bar; sampled for beeswarm/scatter) ──
+    
     explainer   = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X)
-    if isinstance(shap_values, list):      # binary clf → [class0, class1]
+    if isinstance(shap_values, list):      
         shap_values = shap_values[1]
 
-    # Subsample for the plots that show individual points
+    
     rng     = np.random.default_rng(random_seed)
     idx     = rng.choice(len(X), size=min(sample_size, len(X)), replace=False)
     X_s     = X.iloc[idx].reset_index(drop=True)
     sv_s    = shap_values[idx]
 
-    # ── Aggregate one-hot dummies → original feature groups ────────────────
     mean_abs            = np.abs(shap_values).mean(axis=0)
+    pd.Series(mean_abs, index=X.columns).sort_values(ascending=False).to_csv(
+    RESULTS_DIR / f"shap_importance_{model_label}_raw_dummies.csv")
     importance_grouped  = aggregate_onehot_importance(mean_abs, X.columns)
     importance_grouped.to_csv(
         RESULTS_DIR / f"shap_importance_{model_label}.csv",
@@ -154,7 +131,6 @@ def run_shap(model, X, model_label, sample_size=500, random_seed=RANDOM_SEED):
     sv_top10     = sv_s[:, top10_mask]
     disp_names   = [col_group(c) for c in X_top10.columns]
 
-    # ── Figure 1: Bar chart (aggregated mean |SHAP|, top 10) ───────────────
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.barh(
         top10.index[::-1],
@@ -174,7 +150,6 @@ def run_shap(model, X, model_label, sample_size=500, random_seed=RANDOM_SEED):
                     dpi=300, bbox_inches="tight")
     plt.close()
 
-    # ── Figure 2: Beeswarm (direction + magnitude, sampled) ────────────────
     plt.figure(figsize=(8, 5))
     shap.summary_plot(
         sv_top10, X_top10,
@@ -191,8 +166,6 @@ def run_shap(model, X, model_label, sample_size=500, random_seed=RANDOM_SEED):
                     dpi=300, bbox_inches="tight")
     plt.close()
 
-    # ── Figure 3: Waterfall for one representative order ───────────────────
-    # Choose the order closest to the median predicted SHAP sum (typical case)
     shap_sums    = shap_values.sum(axis=1)
     median_shap  = np.median(shap_sums)
     rep_idx      = int(np.argmin(np.abs(shap_sums - median_shap)))
@@ -217,18 +190,16 @@ def run_shap(model, X, model_label, sample_size=500, random_seed=RANDOM_SEED):
                     dpi=300, bbox_inches="tight")
     plt.close()
 
-    # ── Figure 4: Dependence scatter for the top feature ───────────────────
     top_feature   = top10.index[0]
     top_feat_cols = [c for c in X.columns if col_group(c) == top_feature]
 
     if top_feat_cols:
-        # For a numeric top feature use it directly;
-        # for a categorical group use the summed SHAP across its dummies
+      
         if len(top_feat_cols) == 1:
             feat_vals  = X_s[top_feat_cols[0]].values
             feat_label = top_feature
         else:
-            # Sum one-hot dummies → ordinal proxy (e.g. supplier activity count)
+          
             feat_vals  = X_s[top_feat_cols].sum(axis=1).values
             feat_label = f"{top_feature} (dummy sum)"
 
@@ -266,18 +237,21 @@ def main():
     y_train_clf = train["late"].values
     y_train_reg = train["delay_days"].values
 
-    # ── Fit both models ────────────────────────────────────────────────────
-    clf = CatBoostClassifier(n_estimators=300, random_seed=RANDOM_SEED,
-                             verbose=False)
+    catb_clf_p = load_tuned_classifier_params()
+    print(f"Loaded Optuna-tuned CatBoost classifier params from 03_modeling.py: "
+          f"{catb_clf_p}")
+    clf = CatBoostClassifier(**{**catb_clf_p, "random_seed": RANDOM_SEED,
+                                "verbose": False})
     clf.fit(train_X, y_train_clf)
     imp_clf = run_shap(clf, test_X, "classification")
 
-    reg = CatBoostRegressor(n_estimators=300, random_seed=RANDOM_SEED,
-                            verbose=False)
+    print(f"Using 03_modeling.py's fixed CatBoost regressor params: "
+          f"{CATBOOST_REG_PARAMS}")
+    reg = CatBoostRegressor(**{**CATBOOST_REG_PARAMS, "random_seed": RANDOM_SEED,
+                               "verbose": False})
     reg.fit(train_X, y_train_reg)
     imp_reg = run_shap(reg, test_X, "regression")
 
-    # ── Figure 5: Side-by-side bar comparison (classification vs regression) ─
     top_n   = 10
     labels  = imp_clf.head(top_n).index.tolist()
     clf_v   = imp_clf.reindex(labels).fillna(0).values

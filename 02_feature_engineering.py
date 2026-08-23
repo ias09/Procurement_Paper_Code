@@ -1,31 +1,3 @@
-"""
-02_feature_engineering.py  (v2 — enriched features for score optimization)
-==========================================================================
-Proposal mapping: Section 8 (Feature Engineering) -- order-level, supplier
-historical, and reliability trajectory features.
-
-LEAKAGE-SAFETY RULE: unchanged from v1. For PO i with order_date d_i and
-supplier s, every supplier-history feature is computed using ONLY rows of
-supplier s with order_date < d_i (strictly), using date-boundary searchsorted
-with deterministic (order_date, po_id) sort key so same-day sibling orders
-never contaminate each other's history.
-
-WHAT'S NEW vs v1:
-  - Rolling-10 and rolling-30 order windows (fills the 5 <-> 90-day gap)
-  - Days-since-last-late: recency of the supplier's most recent failure
-  - Lead-time ratio: promised / category typical (how tight is this order?)
-  - Supplier × category interaction: some suppliers underperform specifically
-    on certain material types (interaction captured via cross-aggregations)
-  - Cold-start indicator flag: first-N-orders binary, since NaN-filled
-    early orders are qualitatively different from mature supplier histories
-  - Workload proxy: concurrent orders placed to same supplier in last 30 days
-    (now computed correctly from the clean df, not from generator internals)
-
-Outputs:
-  - data/synthetic_features.csv
-  - data/dataset1_features.csv
-"""
-
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -45,14 +17,13 @@ def _strictly_past_indices(dates: np.ndarray, i: int) -> np.ndarray:
 
 
 def _supplier_group_features(group: pd.DataFrame) -> pd.DataFrame:
-    """All rolling supplier-history windows, strictly leakage-safe."""
+   
     group = group.sort_values(["order_date", "po_id"]).reset_index(drop=True)
     dates = group["order_date"].values
     late = group["late"].values.astype(float)
     delay = group["delay_days"].values.astype(float)
     n = len(group)
 
-    # --- allocate output arrays ---
     ontime5 = np.full(n, np.nan);   avgdelay5 = np.full(n, np.nan)
     maxdelay5 = np.full(n, np.nan); stddelay5 = np.full(n, np.nan)
     p90delay5 = np.full(n, np.nan)
@@ -79,17 +50,14 @@ def _supplier_group_features(group: pd.DataFrame) -> pd.DataFrame:
         if len(past_idx) == 0:
             continue
 
-        # --- workload: how many orders placed to this supplier in last 30d ---
         cutoff30 = dates[i] - thirty_days
         workload_30d[i] = np.sum(dates[past_idx] >= cutoff30)
 
-        # --- days since last late delivery ---
         late_past_idx = past_idx[late[past_idx] == 1]
         if len(late_past_idx) > 0:
             last_late_date = dates[late_past_idx[-1]]
             days_since_last_late[i] = (dates[i] - last_late_date) / np.timedelta64(1, "D")
 
-        # --- rolling-5 ---
         last5 = past_idx[-5:]
         ontime5[i]   = 1 - late[last5].mean()
         avgdelay5[i] = delay[last5].mean()
@@ -97,19 +65,16 @@ def _supplier_group_features(group: pd.DataFrame) -> pd.DataFrame:
         if len(last5) >= 2: stddelay5[i] = delay[last5].std(ddof=0)
         p90delay5[i] = np.percentile(delay[last5], 90)
 
-        # --- rolling-10 ---
         last10 = past_idx[-10:]
         ontime10[i]   = 1 - late[last10].mean()
         avgdelay10[i] = delay[last10].mean()
         if len(last10) >= 2: stddelay10[i] = delay[last10].std(ddof=0)
 
-        # --- rolling-30 ---
         last30 = past_idx[-30:]
         ontime30[i]   = 1 - late[last30].mean()
         avgdelay30[i] = delay[last30].mean()
         if len(last30) >= 2: stddelay30[i] = delay[last30].std(ddof=0)
 
-        # --- rolling-90 day (time-based, not count-based) ---
         cutoff90 = dates[i] - ninety_days
         win90 = past_idx[dates[past_idx] >= cutoff90]
         if len(win90) > 0:
@@ -183,20 +148,19 @@ def add_order_level_features(df: pd.DataFrame) -> pd.DataFrame:
     df["log_quantity"]  = np.log1p(df["quantity"])
     df["log_unit_price"] = np.log1p(df["unit_price"])
 
-    # lead-time ratio: how tight is this promise vs category norm
     typical = df["material_or_category"].map(CATEGORY_TYPICAL_LEAD)
     df["lead_time_ratio"] = df["promised_lead_time"] / typical.clip(lower=1)
     df["lead_time_tight"] = (df["promised_lead_time"] < typical).astype(int)
 
-    # cold-start indicator
-    df["cold_start"] = 0  # will be set after supplier history is computed
+
+    df["cold_start"] = 0  
     return df
 
 
 def add_supplier_history_features(df: pd.DataFrame) -> pd.DataFrame:
     parts = [_supplier_group_features(g) for _, g in df.groupby("supplier_id")]
     out = pd.concat(parts, ignore_index=True)
-    # cold-start: fewer than 5 prior orders -> rolling features are noisy/missing
+
     out["cold_start"] = (out["supplier_order_count_so_far"] < 5).astype(int)
     return out
 
@@ -207,13 +171,9 @@ def add_trajectory_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Supplier × category cross-features: some suppliers underperform
-    specifically on certain material types. We can't one-hot both because
-    the combinations explode — instead use a numeric interaction:
-    supplier's rolling avg delay RELATIVE to the category-level avg delay
-    seen so far in the training data. Also: workload × tight-lead-time."""
+   
     df = df.copy()
-    # category-level mean delay (from rolling-90 where available, else 0)
+
     cat_avg = df.groupby("material_or_category")["supplier_avg_delay_90"].transform("mean").fillna(0)
     df["delay_vs_category_avg"] = (df["supplier_avg_delay_90"].fillna(0) - cat_avg)
     df["workload_x_tight_lead"] = df["supplier_workload_30d"] * df["lead_time_tight"]
@@ -245,7 +205,6 @@ def main():
     ds1_feat.to_csv(DATA_DIR / "dataset1_features.csv", index=False)
     print(f"dataset1_features.csv: {ds1_feat.shape}")
 
-    # leakage sanity
     first_rows = synthetic_feat.sort_values(["supplier_id", "order_date"]).groupby("supplier_id").head(1)
     print("\nFirst-order supplier_avg_delay_5 (should all be NaN):",
           first_rows["supplier_avg_delay_5"].isna().all())

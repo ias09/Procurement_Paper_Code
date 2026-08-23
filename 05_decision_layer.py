@@ -1,52 +1,3 @@
-"""
-05_decision_layer.py
-======================
-Proposal mapping: Sections 13-15 (Cost-Sensitive Optimization, Expected-Cost
-Optimization, Service-Level-Constrained Optimization), Section 17 (Decision
-Layer / six policies), Section 18.2 (Decision Metrics).
-
-COST MODEL (as agreed with user -- scaled per PO by unit_price, not fixed
-constants, since orders vary widely in value):
-    c_hold_i  = 0.05% of unit_price_i   per buffer day
-    c_short_i = 2%    of unit_price_i   per late day beyond the buffer
-    (≈40:1 ratio, matching the spirit of the proposal's worked example)
-
-SIX POLICIES (Section 17, Table 4/12/13):
-  1. ERP Baseline        -- buffer = 0 (trust promised date only)
-  2. Historical Buffer   -- buffer = supplier's TRAIN-period average delay
-                             (reuses 03_modeling.py's historical_avg baseline)
-  3. Quantile Buffer     -- buffer = predicted 90th-percentile delay
-                             (new dedicated q=0.90 LightGBM quantile model)
-  4. Conformal Buffer    -- buffer = conformal upper bound from
-                             04_conformal_prediction.py (90% coverage)
-  5. Cost-Optimal Buffer -- buffer minimizing E[cost] (Section 14), found via
-                             grid search using a calibration-residual-based
-                             simulated delay distribution per PO (see below)
-  6. Service-Level Buffer-- smallest buffer with P(delay <= buffer) >= beta
-                             (beta = 0.95, Section 15), same simulated
-                             distribution as policy 5
-
-HOW WE SIMULATE THE PER-PO DELAY DISTRIBUTION FOR POLICIES 5 & 6:
-  We fit one more quantile model at q=0.50 (median) on TRAIN. On the
-  CALIBRATION fold we compute residuals = actual_delay - median_prediction.
-  For a given test PO, we approximate its predicted delay distribution as
-  {median_prediction(x) + r : r in calibration residuals}, clipped at 0.
-  This reuses the calibration fold's empirical error distribution (already
-  reserved exclusively for calibration, never touched in training) rather
-  than assuming a parametric distribution -- consistent with the proposal's
-  distribution-free philosophy in Section 9.
-
-EVALUATION (Section 18.2): for each policy and each PO, we compute the
-REALIZED cost and REALIZED service-level outcome using the PO's actual
-delay_days (ground truth, available in this offline evaluation), so the six
-policies can be compared on equal footing.
-
-Outputs:
-  - results/buffer_decisions_test.csv
-  - results/buffer_decisions_fold2.csv
-  - results/policy_comparison.csv      (mean cost, mean buffer, service-level
-                                         attainment per policy, per fold)
-"""
 
 import warnings
 from pathlib import Path
@@ -58,10 +9,10 @@ from lightgbm import LGBMRegressor
 warnings.filterwarnings("ignore")
 
 RANDOM_SEED = 42
-BETA = 0.95          # required service level (Section 15)
-HOLDING_COST_RATE = 0.0005   # 0.05% of unit_price per buffer day
-SHORTAGE_COST_RATE = 0.02    # 2% of unit_price per late day beyond buffer
-BUFFER_GRID = np.arange(0, 31, 1)  # candidate buffers to search, in days
+BETA = 0.95          
+HOLDING_COST_RATE = 0.0005   
+SHORTAGE_COST_RATE = 0.02    
+BUFFER_GRID = np.arange(0, 31, 1)  
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
@@ -121,43 +72,38 @@ def cost_function(buffer, realized_delay, c_hold, c_short):
 
 
 def cost_optimal_and_service_level_buffers(median_pred, calib_residuals, c_hold, c_short, beta=BETA):
-    """For each PO (vectorized over POs), search BUFFER_GRID to find:
-       - the cost-minimizing buffer (Section 14)
-       - the smallest buffer satisfying the service-level constraint (Section 15)
-    using the simulated distribution {median_pred + r, r in calib_residuals}, clipped at 0."""
+
     n_po = len(median_pred)
     n_resid = len(calib_residuals)
 
-    # simulated_delay[i, j] = simulated delay for PO i under residual sample j
-    simulated_delay = np.clip(median_pred[:, None] + calib_residuals[None, :], 0, None)  # (n_po, n_resid)
+
+    simulated_delay = np.clip(median_pred[:, None] + calib_residuals[None, :], 0, None) 
 
     cost_optimal_buffer = np.zeros(n_po)
     service_level_buffer = np.zeros(n_po)
     best_cost_so_far = np.full(n_po, np.inf)
+    resolved = np.zeros(n_po, dtype=bool)
 
     for b in BUFFER_GRID:
-        shortage = np.maximum(0, simulated_delay - b)  # (n_po, n_resid)
-        expected_cost_b = c_hold * b + c_short * shortage.mean(axis=1)  # (n_po,)
+        shortage = np.maximum(0, simulated_delay - b) 
+        expected_cost_b = c_hold * b + c_short * shortage.mean(axis=1)  
         improve_mask = expected_cost_b < best_cost_so_far
         cost_optimal_buffer[improve_mask] = b
         best_cost_so_far[improve_mask] = expected_cost_b[improve_mask]
 
-        coverage_b = (simulated_delay <= b).mean(axis=1)  # (n_po,)
-        # first buffer (smallest b, since grid ascending) hitting the service level
-        not_yet_set = service_level_buffer == 0
-        newly_satisfied = not_yet_set & (coverage_b >= beta) & (b > 0)
-        # handle b=0 case separately (can satisfy at b=0 if all simulated delays are 0)
-        if b == 0:
-            satisfied_at_zero = coverage_b >= beta
-            service_level_buffer[satisfied_at_zero] = 0
-        else:
-            service_level_buffer[newly_satisfied] = b
+        coverage_b = (simulated_delay <= b).mean(axis=1)  
+       
+        newly_satisfied = (~resolved) & (coverage_b >= beta)
+        service_level_buffer[newly_satisfied] = b
+        resolved |= newly_satisfied
 
-    # POs whose service level was never satisfied within the grid: use the grid max
-    unmet = (service_level_buffer == 0) & (
-        (np.clip(median_pred[:, None] + calib_residuals[None, :], 0, None) <= BUFFER_GRID.max()).mean(axis=1) < beta
-    )
-    service_level_buffer[unmet] = BUFFER_GRID.max()
+    
+    service_level_buffer[~resolved] = BUFFER_GRID.max()
+
+    n_zero = int((resolved & (service_level_buffer == 0)).sum())
+    n_unmet = int((~resolved).sum())
+    print(f"Service-level buffers: {n_zero} POs satisfied at 0 days, "
+          f"{n_unmet} POs unmet within grid (capped at {BUFFER_GRID.max()} days)")
 
     return cost_optimal_buffer, service_level_buffer
 
@@ -176,7 +122,7 @@ def main():
     y_train = train["delay_days"].values
     y_calib = calib["delay_days"].values
 
-    # --- dedicated quantile models for this script: q=0.50 (median) and q=0.90 ---
+    
     median_model = LGBMRegressor(objective="quantile", alpha=0.50,
                                   n_estimators=300, random_state=RANDOM_SEED, verbosity=-1)
     q90_model = LGBMRegressor(objective="quantile", alpha=0.90,
@@ -206,6 +152,10 @@ def main():
         c_short = SHORTAGE_COST_RATE * unit_price
 
         median_pred = median_model.predict(X)
+        print(f"[{fold_name}] raw (unclipped) median_pred: min={median_pred.min():.2f}  "
+              f"max={median_pred.max():.2f}  "
+              f"(sentinel bug required min < ~{-1.645*calib_residuals.std():.2f} "
+              f"given calib residual std={calib_residuals.std():.3f})")
         q90_pred = np.clip(q90_model.predict(X), 0, None)
 
         cost_optimal_buf, service_level_buf = cost_optimal_and_service_level_buffers(

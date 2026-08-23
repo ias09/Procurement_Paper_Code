@@ -1,29 +1,9 @@
-"""
-01_preprocessing.py
-====================
-Proposal mapping: Section 6 (Data Description), Section 7 (Target Variable Construction)
-
-Loads:
-  - Synthetic ERP dataset (data/synthetic_raw.xlsx)        -> development / training set
-  - Public Kaggle dataset (data/dataset1_raw.xlsx)         -> external validation set
-
-Harmonizes both into a COMMON SCHEMA so that 02-06 don't need to know which
-dataset they're looking at. Derives PLT / ALT / Delay / DelayDays / Late
-(eqs. 1-5 in the proposal) independently for both, rather than trusting any
-pre-computed columns, so we can verify correctness.
-
-Outputs:
-  - data/synthetic_clean.csv
-  - data/dataset1_clean.csv
-"""
-
 import pandas as pd
 import numpy as np
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
-# Common schema both datasets will be mapped onto.
 COMMON_COLUMNS = [
     "po_id", "supplier_id", "material_or_category", "order_date",
     "promised_delivery_date", "actual_delivery_date", "quantity",
@@ -71,13 +51,12 @@ def load_synthetic() -> pd.DataFrame:
         "total_spend": raw["total_spend"],
         "order_priority_or_type": raw["order_priority"],
     })
-    # carry extra synthetic-only fields through (useful, not required by common schema)
+
     df["plant_id"] = raw["plant_id"]
     df["buyer_id"] = raw["buyer_id"]
 
     df = derive_targets(df)
 
-    # sanity check against the dataset's own pre-computed columns
     mismatch_delay = (df["delay_days"] != raw["delay_days"]).sum()
     mismatch_late = (df["late"] != raw["late"]).sum()
     print(f"[synthetic] recomputed vs provided delay_days mismatches: {mismatch_delay}")
@@ -100,7 +79,7 @@ def load_dataset1() -> pd.DataFrame:
         "total_spend": raw["Line Net"],
         "order_priority_or_type": raw["PO Type"],
     })
-    # extra fields available only in Dataset 1 -- kept for the robustness/extension analysis
+
     df["supplier_tier"] = raw["Supplier Tier"]
     df["supplier_risk"] = raw["Supplier Risk"]
     df["contract_type"] = raw["Contract Type"]
@@ -111,7 +90,6 @@ def load_dataset1() -> pd.DataFrame:
 
     df = derive_targets(df)
 
-    # sanity check against the dataset's own pre-computed columns
     mismatch_delay_sign = (df["delay"] != raw["Days Late"]).sum()
     print(f"[dataset1] recomputed delay vs provided 'Days Late' mismatches: {mismatch_delay_sign}")
     provided_late = (raw["On Time Delivery"] == "No").astype(int)

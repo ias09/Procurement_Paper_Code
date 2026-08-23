@@ -1,28 +1,3 @@
-"""
-03_modeling.py  (v2 — Optuna-tuned + stacking ensemble)
-=========================================================
-Proposal mapping: Section 10 (Model Development), Section 11 (Time-Consistent
-Validation).
-
-IMPROVEMENTS over v1:
-  1. Enriched feature set from 02_feature_engineering.py v2 (rolling-10/30,
-     days_since_last_late, lead_time_ratio, interaction features)
-  2. Optuna hyperparameter tuning for LightGBM and CatBoost, 60 trials each,
-     optimizing ROC-AUC on the CALIBRATION fold so test remains a clean holdout
-  3. Stacking meta-ensemble: base-model probabilities blended via logistic
-     meta-learner fitted on calibration fold
-  4. class_weight="balanced" and scale_pos_weight for classifiers
-
-TEMPORAL SPLIT:
-  Train: 2023-01->2023-12 | Calib: 2024-01->2024-03 | Test: 2024-04->2024-06 | Fold2: 2024-07+
-
-Outputs:
-  - results/model_metrics.csv
-  - results/predictions_test.csv / predictions_fold2.csv
-  - results/fitted_feature_columns.json
-  - results/optuna_best_params.json
-"""
-
 import json, warnings
 from pathlib import Path
 import numpy as np
@@ -174,7 +149,6 @@ def main():
     test_preds        = test[["po_id","supplier_id","order_date","late","delay_days"]].copy()
     fold2_preds       = fold2[["po_id","supplier_id","order_date","late","delay_days"]].copy()
 
-    # baselines
     sup_delay = train.groupby("supplier_id")["delay_days"].mean()
     sup_late  = train.groupby("supplier_id")["late"].mean()
     for fold_name, frame, preds in [("test",test,test_preds),("fold2",fold2,fold2_preds)]:
@@ -189,7 +163,6 @@ def main():
         for m,yp in [("erp_baseline",np.zeros(len(frame))),("historical_avg",hd)]:
             all_metrics.append({"fold":fold_name,"target":"regression","model":m,**reg_metrics(frame["delay_days"].values,yp)})
 
-    # Optuna tuning
     print("\nOptuna tuning (this takes ~4-6 mins)...")
     lgbm_clf_p = tune_lgbm_clf(train_X, y_train_clf, calib_X, y_calib_clf, n_trials=60)
     catb_clf_p = tune_catb_clf(train_X, y_train_clf, calib_X, y_calib_clf, n_trials=60)
@@ -222,7 +195,6 @@ def main():
             all_metrics.append({"fold":fn,"target":"classification","model":name,**clf_metrics(y,p)})
         print(f"  {name}: test ROC-AUC={roc_auc_score(test['late'].values, pt):.4f}")
 
-    # stacking ensemble
     meta_X_calib = np.column_stack(list(base_calib.values()))
     meta_X_test  = np.column_stack(list(base_test.values()))
     meta_X_fold2 = np.column_stack(list(base_fold2.values()))
